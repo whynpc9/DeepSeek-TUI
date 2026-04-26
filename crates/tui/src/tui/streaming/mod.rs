@@ -11,9 +11,16 @@
 
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
+use std::time::Instant;
 use unicode_width::UnicodeWidthStr;
 
 use crate::palette;
+
+pub mod chunking;
+pub mod commit_tick;
+
+pub use chunking::{AdaptiveChunkingPolicy, ChunkingMode};
+pub use commit_tick::{StreamChunker, run_commit_tick};
 /// Collects streaming text and commits complete lines.
 #[derive(Debug, Clone)]
 pub struct MarkdownStreamCollector {
@@ -27,6 +34,14 @@ pub struct MarkdownStreamCollector {
     is_streaming: bool,
     /// Whether this is a thinking block
     is_thinking: bool,
+}
+
+impl Default for MarkdownStreamCollector {
+    fn default() -> Self {
+        // `is_streaming: true` matches `MarkdownStreamCollector::new` so a
+        // freshly-default block behaves like a freshly-started stream.
+        Self::new(None, false)
+    }
 }
 
 impl MarkdownStreamCollector {
@@ -205,11 +220,20 @@ fn wrap_line(line: &str, width: usize) -> Vec<String> {
     }
 }
 
+/// Per-block streaming substate: collector for newline-gating + chunker/policy
+/// for two-gear pacing.
+#[derive(Debug, Default)]
+struct BlockState {
+    collector: MarkdownStreamCollector,
+    chunker: StreamChunker,
+    policy: AdaptiveChunkingPolicy,
+}
+
 /// State for managing multiple stream collectors (one per content block)
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Default)]
 pub struct StreamingState {
-    /// Collectors for each content block by index
-    collectors: Vec<Option<MarkdownStreamCollector>>,
+    /// Per-block state by index (collector + chunker + policy).
+    blocks: Vec<Option<BlockState>>,
     /// Whether any stream is currently active
     pub is_active: bool,
     /// Accumulated text for display
@@ -227,66 +251,153 @@ impl StreamingState {
     /// Start a new text block
     pub fn start_text(&mut self, index: usize, width: Option<usize>) {
         self.ensure_capacity(index);
-        self.collectors[index] = Some(MarkdownStreamCollector::new(width, false));
+        self.blocks[index] = Some(BlockState {
+            collector: MarkdownStreamCollector::new(width, false),
+            chunker: StreamChunker::new(),
+            policy: AdaptiveChunkingPolicy::new(),
+        });
         self.is_active = true;
     }
 
     /// Start a new thinking block
     pub fn start_thinking(&mut self, index: usize, width: Option<usize>) {
         self.ensure_capacity(index);
-        self.collectors[index] = Some(MarkdownStreamCollector::new(width, true));
+        self.blocks[index] = Some(BlockState {
+            collector: MarkdownStreamCollector::new(width, true),
+            chunker: StreamChunker::new(),
+            policy: AdaptiveChunkingPolicy::new(),
+        });
         self.is_active = true;
     }
 
-    /// Push content to a block
+    /// Push content to a block. The text is buffered in the collector and
+    /// any newline-complete portion is forwarded to the chunker, which decides
+    /// what (if anything) becomes visible on the next [`Self::commit_text`] tick.
     pub fn push_content(&mut self, index: usize, content: &str) {
-        if let Some(Some(collector)) = self.collectors.get_mut(index) {
-            collector.push(content);
+        if let Some(Some(block)) = self.blocks.get_mut(index) {
+            block.collector.push(content);
             // Update accumulated text
-            if collector.is_thinking {
+            if block.collector.is_thinking {
                 self.accumulated_thinking.push_str(content);
             } else {
                 self.accumulated_text.push_str(content);
             }
+
+            // Forward newline-complete bytes to the chunker. Partial trailing
+            // content stays in the collector buffer (this is what protects
+            // partial code fences and other line-sensitive markdown from
+            // becoming briefly visible).
+            let committed = block.collector.commit_complete_text();
+            if !committed.is_empty() {
+                block.chunker.push_delta(&committed);
+            }
         }
     }
 
-    /// Get newly committed lines from a block
+    /// Get newly committed lines from a block. (Legacy entry point that maps
+    /// onto the chunker.)
     pub fn commit_lines(&mut self, index: usize) -> Vec<Line<'static>> {
-        if let Some(Some(collector)) = self.collectors.get_mut(index) {
-            collector.commit_complete_lines()
-        } else {
-            Vec::new()
+        let text = self.commit_text(index);
+        if text.is_empty() {
+            return Vec::new();
         }
+        // Re-render the text through the same path the collector used.
+        let style = if self
+            .blocks
+            .get(index)
+            .and_then(|b| b.as_ref())
+            .is_some_and(|b| b.collector.is_thinking)
+        {
+            Style::default()
+                .fg(palette::STATUS_WARNING)
+                .add_modifier(Modifier::DIM | Modifier::ITALIC)
+        } else {
+            Style::default()
+        };
+        let mut lines = Vec::new();
+        for line in text.lines() {
+            lines.push(Line::from(Span::styled(line.to_string(), style)));
+        }
+        if text.ends_with('\n') {
+            lines.push(Line::from(""));
+        }
+        lines
     }
 
-    /// Get newly committed raw text from a block.
+    /// Run one commit-tick of the chunker policy and return any text safe to
+    /// flush to the transcript on this tick. May be empty (Smooth-mode tick
+    /// against an empty queue) or contain anywhere from one line up to the
+    /// full backlog (CatchUp-mode burst drain).
     pub fn commit_text(&mut self, index: usize) -> String {
-        if let Some(Some(collector)) = self.collectors.get_mut(index) {
-            collector.commit_complete_text()
+        if let Some(Some(block)) = self.blocks.get_mut(index) {
+            let now = Instant::now();
+            let out = run_commit_tick(&mut block.policy, &mut block.chunker, now);
+            out.committed_text
         } else {
             String::new()
         }
     }
 
-    /// Finalize a block and get remaining lines
-    pub fn finalize_block(&mut self, index: usize) -> Vec<Line<'static>> {
-        if let Some(Some(collector)) = self.collectors.get_mut(index) {
-            let lines = collector.finalize();
-            // Check if all blocks are done
-            self.check_active();
-            lines
-        } else {
-            Vec::new()
-        }
+    /// Inspect the current chunking mode for a block (testing/observability).
+    pub fn chunking_mode(&self, index: usize) -> Option<ChunkingMode> {
+        self.blocks
+            .get(index)
+            .and_then(|b| b.as_ref())
+            .map(|b| b.policy.mode())
     }
 
-    /// Finalize a block and get remaining raw text.
+    /// Whether the chunker has queued content waiting to be flushed by the
+    /// next commit tick. Useful for callers that want to drive an extra tick
+    /// while the queue drains under Smooth-mode pacing.
+    pub fn has_pending_chunker_lines(&self, index: usize) -> bool {
+        self.blocks
+            .get(index)
+            .and_then(|b| b.as_ref())
+            .is_some_and(|b| b.chunker.queued_lines() > 0)
+    }
+
+    /// Finalize a block and get remaining lines
+    pub fn finalize_block(&mut self, index: usize) -> Vec<Line<'static>> {
+        let text = self.finalize_block_text(index);
+        if text.is_empty() {
+            return Vec::new();
+        }
+        let style = if self
+            .blocks
+            .get(index)
+            .and_then(|b| b.as_ref())
+            .is_some_and(|b| b.collector.is_thinking)
+        {
+            Style::default()
+                .fg(palette::STATUS_WARNING)
+                .add_modifier(Modifier::DIM | Modifier::ITALIC)
+        } else {
+            Style::default()
+        };
+        let mut lines = Vec::new();
+        for line in text.lines() {
+            lines.push(Line::from(Span::styled(line.to_string(), style)));
+        }
+        if text.ends_with('\n') {
+            lines.push(Line::from(""));
+        }
+        lines
+    }
+
+    /// Finalize a block and get remaining raw text. Drains any chunker
+    /// backlog plus any unterminated partial line in the collector.
     pub fn finalize_block_text(&mut self, index: usize) -> String {
-        if let Some(Some(collector)) = self.collectors.get_mut(index) {
-            let text = collector.finalize_text();
+        if let Some(Some(block)) = self.blocks.get_mut(index) {
+            // First, push any tail buffered in the collector through (it may
+            // not be newline-terminated; finalize_text returns it raw).
+            let tail = block.collector.finalize_text();
+            // Any whole-line text held by the chunker is safe to emit now.
+            let mut out = block.chunker.drain_remaining();
+            if !tail.is_empty() {
+                out.push_str(&tail);
+            }
             self.check_active();
-            text
+            out
         } else {
             String::new()
         }
@@ -295,12 +406,11 @@ impl StreamingState {
     /// Finalize all blocks
     pub fn finalize_all(&mut self) -> Vec<(usize, Vec<Line<'static>>)> {
         let mut result = Vec::new();
-        for (i, collector) in self.collectors.iter_mut().enumerate() {
-            if let Some(c) = collector {
-                let lines = c.finalize();
-                if !lines.is_empty() {
-                    result.push((i, lines));
-                }
+        let len = self.blocks.len();
+        for i in 0..len {
+            let lines = self.finalize_block(i);
+            if !lines.is_empty() {
+                result.push((i, lines));
             }
         }
         self.is_active = false;
@@ -309,22 +419,22 @@ impl StreamingState {
 
     /// Check if any stream is still active
     fn check_active(&mut self) {
-        self.is_active = self.collectors.iter().any(|c| {
-            c.as_ref()
-                .is_some_and(MarkdownStreamCollector::is_streaming)
+        self.is_active = self.blocks.iter().any(|b| {
+            b.as_ref()
+                .is_some_and(|state| state.collector.is_streaming())
         });
     }
 
     /// Ensure capacity for the given index
     fn ensure_capacity(&mut self, index: usize) {
-        while self.collectors.len() <= index {
-            self.collectors.push(None);
+        while self.blocks.len() <= index {
+            self.blocks.push(None);
         }
     }
 
     /// Reset the streaming state
     pub fn reset(&mut self) {
-        self.collectors.clear();
+        self.blocks.clear();
         self.is_active = false;
         self.accumulated_text.clear();
         self.accumulated_thinking.clear();
