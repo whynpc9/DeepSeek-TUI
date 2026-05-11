@@ -12,6 +12,7 @@ use anyhow::{Context, Result};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::time::timeout as tokio_timeout;
+use tracing::Instrument;
 
 /// Default idle timeout for SSE stream reads (300 seconds = 5 minutes).
 /// After this period with no data, the stream is considered stalled and
@@ -75,6 +76,64 @@ impl DeepSeekClient {
         &self,
         request: &MessageRequest,
     ) -> Result<MessageResponse> {
+        // GenAI semconv span (https://opentelemetry.io/docs/specs/semconv/gen-ai/).
+        // Fields are filled in after the response so SigNoz's LLM view can group
+        // by model and surface latency / token cost without parsing the body.
+        let span = tracing::info_span!(
+            "gen_ai.chat",
+            otel.name = %format!("chat {}", request.model),
+            otel.kind = "client",
+            gen_ai.system = %self.api_provider.as_str(),
+            gen_ai.operation.name = "chat",
+            gen_ai.request.model = %request.model,
+            gen_ai.request.max_tokens = request.max_tokens,
+            gen_ai.request.temperature = request.temperature.unwrap_or(f32::NAN) as f64,
+            gen_ai.request.top_p = request.top_p.unwrap_or(f32::NAN) as f64,
+            gen_ai.request.reasoning_effort = tracing::field::Empty,
+            gen_ai.response.model = tracing::field::Empty,
+            gen_ai.response.id = tracing::field::Empty,
+            gen_ai.response.finish_reasons = tracing::field::Empty,
+            gen_ai.usage.input_tokens = tracing::field::Empty,
+            gen_ai.usage.output_tokens = tracing::field::Empty,
+            gen_ai.usage.reasoning_tokens = tracing::field::Empty,
+            error = tracing::field::Empty,
+            error.message = tracing::field::Empty,
+        );
+        if let Some(effort) = request.reasoning_effort.as_deref() {
+            span.record("gen_ai.request.reasoning_effort", effort);
+        }
+        // `Span` is internally `Arc`-backed, so cloning is cheap and keeps a
+        // handle for post-await `.record()` calls without holding an `Enter`
+        // guard across an await point (which would break async correctness).
+        let span_for_attrs = span.clone();
+        let response = self
+            .create_message_chat_inner(request)
+            .instrument(span)
+            .await;
+        match &response {
+            Ok(message) => {
+                span_for_attrs.record("gen_ai.response.model", message.model.as_str());
+                if !message.id.is_empty() {
+                    span_for_attrs.record("gen_ai.response.id", message.id.as_str());
+                }
+                span_for_attrs.record("gen_ai.usage.input_tokens", message.usage.input_tokens);
+                span_for_attrs.record("gen_ai.usage.output_tokens", message.usage.output_tokens);
+                if let Some(reasoning) = message.usage.reasoning_tokens {
+                    span_for_attrs.record("gen_ai.usage.reasoning_tokens", reasoning);
+                }
+                if let Some(reason) = message.stop_reason.as_deref() {
+                    span_for_attrs.record("gen_ai.response.finish_reasons", reason);
+                }
+            }
+            Err(err) => {
+                span_for_attrs.record("error", true);
+                span_for_attrs.record("error.message", err.to_string().as_str());
+            }
+        }
+        response
+    }
+
+    async fn create_message_chat_inner(&self, request: &MessageRequest) -> Result<MessageResponse> {
         let messages = build_chat_messages_for_request(request);
         let mut body = json!({
             "model": request.model,
@@ -143,6 +202,55 @@ impl DeepSeekClient {
     pub(super) async fn handle_chat_completion_stream(
         &self,
         request: MessageRequest,
+    ) -> Result<StreamEventBox> {
+        // GenAI span for the streamed chat call. We capture request attrs up
+        // front and record usage / finish-reason as `MessageDelta` events fly
+        // by inside the inner `async_stream!`. The span instance is cloned
+        // into the stream closure and dropped when the consumer finishes
+        // polling, which closes the span and triggers the OTLP exporter.
+        let span = tracing::info_span!(
+            "gen_ai.chat.stream",
+            otel.name = %format!("chat.stream {}", request.model),
+            otel.kind = "client",
+            gen_ai.system = %self.api_provider.as_str(),
+            gen_ai.operation.name = "chat.stream",
+            gen_ai.request.model = %request.model,
+            gen_ai.request.max_tokens = request.max_tokens,
+            gen_ai.request.streaming = true,
+            gen_ai.request.temperature = request.temperature.unwrap_or(f32::NAN) as f64,
+            gen_ai.request.top_p = request.top_p.unwrap_or(f32::NAN) as f64,
+            gen_ai.request.reasoning_effort = tracing::field::Empty,
+            gen_ai.request.tool_count = request.tools.as_ref().map_or(0, Vec::len),
+            gen_ai.response.model = tracing::field::Empty,
+            gen_ai.response.finish_reasons = tracing::field::Empty,
+            gen_ai.usage.input_tokens = tracing::field::Empty,
+            gen_ai.usage.output_tokens = tracing::field::Empty,
+            gen_ai.usage.reasoning_tokens = tracing::field::Empty,
+            gen_ai.stream.bytes = tracing::field::Empty,
+            gen_ai.stream.duration_ms = tracing::field::Empty,
+            error = tracing::field::Empty,
+            error.message = tracing::field::Empty,
+        );
+        if let Some(effort) = request.reasoning_effort.as_deref() {
+            span.record("gen_ai.request.reasoning_effort", effort);
+        }
+        let send_span = span.clone();
+        let stream_span = span.clone();
+        let result = self
+            .handle_chat_completion_stream_inner(request, stream_span)
+            .instrument(send_span)
+            .await;
+        if let Err(err) = &result {
+            span.record("error", true);
+            span.record("error.message", err.to_string().as_str());
+        }
+        result
+    }
+
+    async fn handle_chat_completion_stream_inner(
+        &self,
+        request: MessageRequest,
+        stream_span: tracing::Span,
     ) -> Result<StreamEventBox> {
         // Try true SSE streaming via chat completions (widely supported)
         let messages = build_chat_messages_for_request(&request);
@@ -221,6 +329,11 @@ impl DeepSeekClient {
         let response_headers = format_stream_headers(response.headers());
         let byte_stream = response.bytes_stream();
 
+        // Move the OTel span into the stream closure so it stays alive while
+        // the consumer is polling. When the closure ends (consumer drops the
+        // stream or it finishes naturally) the last span clone is dropped and
+        // the SDK schedules the span for export.
+        let span = stream_span;
         let stream = async_stream::stream! {
             use futures_util::StreamExt;
 
@@ -242,6 +355,7 @@ impl DeepSeekClient {
                     },
                 },
             });
+            span.record("gen_ai.response.model", model.as_str());
 
             let mut line_buf = String::new();
             let mut byte_buf = acquire_stream_buffer();
@@ -356,6 +470,21 @@ impl DeepSeekClient {
                                     {
                                         usage.reasoning_replay_tokens = Some(tokens);
                                     }
+                                    // Mirror final usage / finish reason onto the
+                                    // GenAI span so SigNoz can group by model and
+                                    // chart token cost without parsing the body.
+                                    if let StreamEvent::MessageDelta { delta, usage } = &event {
+                                        if let Some(usage) = usage {
+                                            span.record("gen_ai.usage.input_tokens", usage.input_tokens);
+                                            span.record("gen_ai.usage.output_tokens", usage.output_tokens);
+                                            if let Some(reasoning) = usage.reasoning_tokens {
+                                                span.record("gen_ai.usage.reasoning_tokens", reasoning);
+                                            }
+                                        }
+                                        if let Some(reason) = delta.stop_reason.as_deref() {
+                                            span.record("gen_ai.response.finish_reasons", reason);
+                                        }
+                                    }
                                     yield Ok(event);
                                 }
                             }
@@ -385,6 +514,14 @@ impl DeepSeekClient {
             }
 
             release_stream_buffer(byte_buf);
+            // Final OTel attributes: stream byte count + wall-clock duration.
+            // Recorded before `MessageStop` so consumers that immediately drop
+            // the stream still get the attributes baked into the exported span.
+            span.record("gen_ai.stream.bytes", bytes_received);
+            span.record(
+                "gen_ai.stream.duration_ms",
+                stream_start.elapsed().as_millis() as u64,
+            );
             yield Ok(StreamEvent::MessageStop);
         };
 

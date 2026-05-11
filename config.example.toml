@@ -501,6 +501,36 @@ default_text_model = "deepseek-ai/deepseek-v4-pro"
 # cors_origins = ["http://localhost:5173", "http://127.0.0.1:5173"]
 
 # ─────────────────────────────────────────────────────────────────────────────────
+# OpenTelemetry / OTLP Tracing (LLM Observability)
+# ─────────────────────────────────────────────────────────────────────────────────
+# Export gen_ai.* spans for every chat / chat.stream call to any OTLP backend
+# (SigNoz, Jaeger, Tempo, Honeycomb, Langfuse, ...). The recommended local
+# stack is **SigNoz on Docker** — see `docs/OPENTELEMETRY.md` for the compose
+# file and dashboard walkthrough.
+#
+# Resolution order: env vars (`DEEPSEEK_OTEL_*`, standard `OTEL_*`) override
+# every field below. Spans use the experimental GenAI semantic conventions so
+# SigNoz's "LLM" view groups by `gen_ai.request.model` out of the box.
+#
+# Prompt / completion text is **redacted by default** (`redact_content = true`).
+# Flip it off only on trusted local collectors — prompts can carry workspace
+# contents.
+#
+# [telemetry]
+# enabled = true                                       # opt-in master switch
+# endpoint = "http://localhost:4318"                   # SigNoz OTLP/HTTP port
+# # endpoint = "http://localhost:4317"                 # SigNoz OTLP/gRPC port (requires grpc-tonic feature)
+# protocol = "http/protobuf"                           # "http/protobuf" (default) | "grpc"
+# service_name = "deepseek-tui"                        # `service.name` resource attribute
+# environment = "local"                                # `deployment.environment.name` (prod / staging / ...)
+# redact_content = true                                # leave true unless you trust every viewer of the trace
+# log_filter = "info,deepseek_tui=info"                # respected only when RUST_LOG is unset
+#
+# # Headers for hosted backends that require an ingestion key:
+# # [telemetry.headers]
+# # "signoz-access-token" = "..."
+
+# ─────────────────────────────────────────────────────────────────────────────────
 # Requirements (admin constraints) example file
 # ─────────────────────────────────────────────────────────────────────────────────
 # allowed_approval_policies = ["on-request", "untrusted", "never"]

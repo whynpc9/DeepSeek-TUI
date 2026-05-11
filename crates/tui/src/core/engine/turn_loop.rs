@@ -261,6 +261,21 @@ impl Engine {
             // Stream the response. Keep the request around (cloned into the
             // first call) so we can resend it on a transparent retry below
             // when the wire dies before any content was streamed (#103).
+            //
+            // We emit a one-shot `tracing::info!` event so SigNoz / any OTel
+            // log sink can correlate the immediately-following
+            // `gen_ai.chat.stream` span back to the turn that produced it. A
+            // wrapper span would either be held across `.await` (bad for
+            // tokio task scheduling) or require restructuring the loop, so
+            // we attach the metadata as a sibling event instead.
+            tracing::info!(
+                target: "deepseek.turn",
+                turn_id = %turn.id,
+                turn_step = turn.step,
+                model = %self.session.model,
+                mode = ?mode,
+                "starting model request",
+            );
             let stream_request = request;
             let stream_result = client.create_message_stream(stream_request.clone()).await;
             let stream = match stream_result {

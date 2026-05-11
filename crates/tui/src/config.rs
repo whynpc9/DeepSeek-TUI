@@ -856,6 +856,54 @@ pub struct Config {
     /// default threshold of 4 096 tokens applies and routing is active.
     #[serde(default)]
     pub workshop: Option<crate::tools::large_output_router::WorkshopConfig>,
+
+    /// OpenTelemetry exporter for LLM tracing. When absent or disabled, no
+    /// spans are exported. See `crate::telemetry` for the runtime wiring and
+    /// `docs/OPENTELEMETRY.md` for SigNoz setup.
+    #[serde(default)]
+    pub telemetry: Option<TelemetryConfig>,
+}
+
+/// `[telemetry]` table — OpenTelemetry / OTLP exporter knobs.
+///
+/// All fields are optional; the resolved runtime defaults live in
+/// [`crate::telemetry::TelemetrySettings`]. Env vars override the file:
+/// `DEEPSEEK_OTEL_ENABLED`, `OTEL_EXPORTER_OTLP_ENDPOINT`,
+/// `OTEL_EXPORTER_OTLP_PROTOCOL`, `OTEL_SERVICE_NAME`, `OTEL_RESOURCE_ATTRIBUTES`.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct TelemetryConfig {
+    /// Master switch. Defaults to `false` — telemetry is opt-in.
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    /// OTLP collector endpoint, e.g. `http://localhost:4318` (HTTP) or
+    /// `http://localhost:4317` (gRPC). For SigNoz running on the same
+    /// Docker host, the HTTP port `4318` works out of the box.
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    /// OTLP transport: `http/protobuf` (default) or `grpc`. SigNoz's
+    /// OTLP receiver accepts both; HTTP is firewall-friendlier.
+    #[serde(default)]
+    pub protocol: Option<String>,
+    /// `service.name` resource attribute. Defaults to `deepseek-tui`.
+    #[serde(default)]
+    pub service_name: Option<String>,
+    /// Optional deployment / environment label (`prod`, `staging`, ...).
+    #[serde(default)]
+    pub environment: Option<String>,
+    /// Extra OTLP headers (`OTEL_EXPORTER_OTLP_HEADERS`). Useful for hosted
+    /// SigNoz / vendor backends that require an ingestion key.
+    #[serde(default)]
+    pub headers: Option<HashMap<String, String>>,
+    /// Whether to redact prompt / completion text from span events so only
+    /// metadata (token counts, latency, finish reason) is exported.
+    /// Defaults to `true` — set to `false` only inside trusted environments.
+    #[serde(default)]
+    pub redact_content: Option<bool>,
+    /// `tracing` subscriber filter directive applied alongside the OTLP
+    /// layer. Defaults to `"info,deepseek_tui=info"`. Respected only when
+    /// `RUST_LOG` is not already set.
+    #[serde(default)]
+    pub log_filter: Option<String>,
 }
 
 /// `[runtime_api]` table — knobs for the local HTTP/SSE daemon.
@@ -2578,6 +2626,7 @@ fn merge_config(base: Config, override_cfg: Config) -> Config {
         strict_tool_mode: override_cfg.strict_tool_mode.or(base.strict_tool_mode),
         runtime_api: override_cfg.runtime_api.or(base.runtime_api),
         workshop: override_cfg.workshop.or(base.workshop),
+        telemetry: override_cfg.telemetry.or(base.telemetry),
     }
 }
 

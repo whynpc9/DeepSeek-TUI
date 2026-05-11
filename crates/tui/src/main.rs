@@ -64,6 +64,7 @@ mod skill_state;
 mod skills;
 mod snapshot;
 mod task_manager;
+mod telemetry;
 #[cfg(test)]
 mod test_support;
 mod tools;
@@ -633,6 +634,13 @@ async fn main() -> Result<()> {
     dotenv().ok();
     let cli = Cli::parse();
     logging::set_verbose(cli.verbose || logging::env_requests_verbose_logging());
+
+    // Initialize OpenTelemetry as early as possible so spans emitted during
+    // config load / doctor / one-shot exec are still captured. We tolerate a
+    // missing or partial config because the CLI also supports `deepseek
+    // login` / `deepseek doctor` before a config exists. The guard is held
+    // for the rest of `main()` so its `Drop` flushes the batch exporter.
+    let _telemetry_guard = init_telemetry_from_cli(&cli);
 
     // Handle subcommands first
     if let Some(command) = cli.command.clone() {
@@ -2723,6 +2731,32 @@ fn load_config_from_cli(cli: &Cli) -> Result<Config> {
     let mut config = Config::load(cli.config.clone(), profile.as_deref())?;
     cli.feature_toggles.apply(&mut config)?;
     Ok(config)
+}
+
+/// Best-effort telemetry bootstrap. We deliberately swallow any config-load
+/// error here because the CLI also serves first-run flows (`deepseek login`,
+/// `deepseek doctor`) where the config file may not exist yet. When the
+/// config is unreadable we fall back to **env-only** resolution, which still
+/// honors `DEEPSEEK_OTEL_ENABLED` / `OTEL_*` so users can opt-in without a
+/// config file at all.
+fn init_telemetry_from_cli(cli: &Cli) -> telemetry::TelemetryGuard {
+    let profile = cli
+        .profile
+        .clone()
+        .or_else(|| std::env::var("DEEPSEEK_PROFILE").ok());
+    let telemetry_cfg = Config::load(cli.config.clone(), profile.as_deref())
+        .ok()
+        .and_then(|cfg| cfg.telemetry.clone());
+    let settings = telemetry::TelemetrySettings::resolve(telemetry_cfg.as_ref());
+    match telemetry::init(settings) {
+        Ok(guard) => guard,
+        Err(err) => {
+            logging::warn(format!(
+                "Telemetry init returned error ({err}); continuing without tracing."
+            ));
+            telemetry::TelemetryGuard::disabled()
+        }
+    }
 }
 
 fn read_api_key_from_stdin() -> Result<String> {
@@ -5532,6 +5566,7 @@ mod setup_helper_tests {
         let sources = [
             include_str!("config.rs"),
             include_str!("logging.rs"),
+            include_str!("telemetry.rs"),
             include_str!("../../config/src/lib.rs"),
             include_str!("../../cli/src/main.rs"),
         ]
